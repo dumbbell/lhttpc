@@ -52,13 +52,16 @@
         upload_window :: non_neg_integer() | infinity,
         partial_download = false :: true | false,
         download_window = infinity :: timeout(),
-        part_size :: non_neg_integer() | infinity
+        part_size :: non_neg_integer() | infinity,
         %% in case of infinity we read whatever data we can get from
         %% the wire at that point or in case of chunked one chunk
+        drop_response_body = false :: true | false
     }).
 
 -define(CONNECTION_HDR(HDRS, DEFAULT),
     string:to_lower(lhttpc_lib:header_value("connection", HDRS, DEFAULT))).
+
+-define(DROP_BLOCK_SIZE, 4096).
 
 -spec request(pid(), string(), 1..65535, true | false, string(),
         string() | atom(), headers(), iolist(), [option()]) -> no_return().
@@ -127,7 +130,8 @@ execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
         download_window = proplists:get_value(window_size,
             PartialDownloadOptions, infinity),
         part_size = proplists:get_value(part_size,
-            PartialDownloadOptions, infinity)
+            PartialDownloadOptions, infinity),
+        drop_response_body = proplists:get_bool(drop_response_body, Options)
     },
     Response = case send_request(State) of
         {R, undefined} ->
@@ -290,11 +294,12 @@ read_response(State, Vsn, {StatusCode, _} = Status, Hdrs) ->
 
 handle_response_body(#client_state{partial_download = false} = State, Vsn,
         Status, Hdrs) ->
+    Drop = State#client_state.drop_response_body,
     Socket = State#client_state.socket,
     Ssl = State#client_state.ssl,
     Method = State#client_state.method,
     {Body, NewHdrs} = case has_body(Method, element(1, Status), Hdrs) of
-        true  -> read_body(Vsn, Hdrs, Ssl, Socket, body_type(Hdrs));
+        true  -> read_body(Vsn, Hdrs, Ssl, Socket, body_type(Hdrs), Drop);
         false -> {<<>>, Hdrs}
     end,
     {Status, NewHdrs, Body};
@@ -363,13 +368,13 @@ read_partial_body(State, _Vsn, Hdrs, {fixed_length, ContentLength}) ->
     read_partial_finite_body(State, Hdrs, ContentLength,
         State#client_state.download_window).
 
-read_body(_Vsn, Hdrs, Ssl, Socket, chunked) ->
-    read_chunked_body(Socket, Ssl, Hdrs, []);
-read_body(Vsn, Hdrs, Ssl, Socket, infinite) ->
+read_body(_Vsn, Hdrs, Ssl, Socket, chunked, Drop) ->
+    read_chunked_body(Socket, Ssl, Hdrs, [], Drop);
+read_body(Vsn, Hdrs, Ssl, Socket, infinite, Drop) ->
     check_infinite_response(Vsn, Hdrs),
-    read_infinite_body(Socket, Hdrs, Ssl);
-read_body(_Vsn, Hdrs, Ssl, Socket, {fixed_length, ContentLength}) ->
-    read_length(Hdrs, Ssl, Socket, ContentLength).
+    read_infinite_body(Socket, Hdrs, Ssl, Drop);
+read_body(_Vsn, Hdrs, Ssl, Socket, {fixed_length, ContentLength}, Drop) ->
+    read_length(Hdrs, Ssl, Socket, ContentLength, Drop).
 
 read_partial_finite_body(State = #client_state{}, Hdrs, 0, _Window) ->
     reply_end_of_body(State, [], Hdrs);
@@ -425,13 +430,29 @@ read_body_part(#client_state{part_size = PartSize} = State, ContentLength)
             erlang:error(Reason)
     end.
 
-read_length(Hdrs, Ssl, Socket, Length) ->
+read_length(Hdrs, Ssl, Socket, Length, false) ->
     case lhttpc_sock:recv(Socket, Length, Ssl) of
         {ok, Data} ->
             {Data, Hdrs};
         {error, Reason} ->
             erlang:error(Reason)
-    end.
+    end;
+read_length(Hdrs, Ssl, Socket, Length, true) when Length > 0 ->
+    % The caller isn't insterested in the body, but we must read it
+    % from the socket anyway. We read by small chunk of data to avoid
+    % increasing process memory footprint.
+    ReadLength = if
+        Length <  ?DROP_BLOCK_SIZE -> Length;
+        Length >= ?DROP_BLOCK_SIZE -> ?DROP_BLOCK_SIZE
+    end,
+    case lhttpc_sock:recv(Socket, ReadLength, Ssl) of
+        {ok, _} ->
+            read_length(Hdrs, Ssl, Socket, Length - ReadLength, true);
+        {error, Reason} ->
+            erlang:error(Reason)
+    end;
+read_length(Hdrs, _, _, _, true) ->
+    {<<>>, Hdrs}.
 
 read_partial_chunked_body(State, Hdrs, Window, BufferSize, Buffer, 0) ->
     Socket = State#client_state.socket,
@@ -443,7 +464,7 @@ read_partial_chunked_body(State, Hdrs, Window, BufferSize, Buffer, 0) ->
             {Trailers, NewHdrs} = read_trailers(Socket, Ssl, [], Hdrs, <<>>),
             reply_end_of_body(State, Trailers, NewHdrs);
         ChunkSize when PartSize =:= infinity ->
-            Chunk = read_chunk(Socket, Ssl, ChunkSize),
+            Chunk = read_chunk(Socket, Ssl, ChunkSize, false),
             NewWindow = reply_chunked_part(State, [Chunk | Buffer], Window),
             read_partial_chunked_body(State, Hdrs, NewWindow, 0, [], 0);
         ChunkSize when BufferSize + ChunkSize >= PartSize ->
@@ -452,7 +473,7 @@ read_partial_chunked_body(State, Hdrs, Window, BufferSize, Buffer, 0) ->
             NewWindow = reply_chunked_part(State, [Chunk | Buffer], Window),
             read_partial_chunked_body(State, Hdrs, NewWindow, 0, [], RemSize);
         ChunkSize ->
-            Chunk = read_chunk(Socket, Ssl, ChunkSize),
+            Chunk = read_chunk(Socket, Ssl, ChunkSize, false),
             read_partial_chunked_body(State, Hdrs, Window,
                 BufferSize + ChunkSize, [Chunk | Buffer], 0)
     end;
@@ -468,7 +489,7 @@ read_partial_chunked_body(State, Hdrs, Window, BufferSize, Buffer, RemSize) ->
             read_partial_chunked_body(State, Hdrs, NewWindow, 0, [],
                 NewRemSize);
         BufferSize + RemSize < PartSize ->
-            Chunk = read_chunk(Socket, Ssl, RemSize),
+            Chunk = read_chunk(Socket, Ssl, RemSize, false),
             read_partial_chunked_body(State, Hdrs, Window, BufferSize + RemSize,
                 [Chunk | Buffer], 0)
     end.
@@ -500,15 +521,18 @@ reply_chunked_part(#client_state{requester = Pid}, Buffer, Window) ->
         lhttpc_lib:dec(Window)
     end.
 
-read_chunked_body(Socket, Ssl, Hdrs, Chunks) ->
+read_chunked_body(Socket, Ssl, Hdrs, Chunks, Drop) ->
     case read_chunk_size(Socket, Ssl) of
         0 ->
-            Body = list_to_binary(lists:reverse(Chunks)),
+            Body = if
+                Drop -> <<>>;
+                true -> list_to_binary(lists:reverse(Chunks))
+            end,
             {_, NewHdrs} = read_trailers(Socket, Ssl, [], Hdrs, <<>>),
             {Body, NewHdrs};
         Size ->
-            Chunk = read_chunk(Socket, Ssl, Size),
-            read_chunked_body(Socket, Ssl, Hdrs, [Chunk | Chunks])
+            Chunk = read_chunk(Socket, Ssl, Size, Drop),
+            read_chunked_body(Socket, Ssl, Hdrs, [Chunk | Chunks], Drop)
     end.
 
 chunk_size(Bin) ->
@@ -525,7 +549,7 @@ chunk_size(<<Char, Binary/binary>>, Chars) ->
     chunk_size(Binary, [Char | Chars]).
 
 read_partial_chunk(Socket, Ssl, ChunkSize, ChunkSize) ->
-    {read_chunk(Socket, Ssl, ChunkSize), 0};
+    {read_chunk(Socket, Ssl, ChunkSize, false), 0};
 read_partial_chunk(Socket, Ssl, Size, ChunkSize) ->
     ok = lhttpc_sock:setopts(Socket, [{packet, raw}], Ssl),
     case lhttpc_sock:recv(Socket, Size, Ssl) of
@@ -535,7 +559,7 @@ read_partial_chunk(Socket, Ssl, Size, ChunkSize) ->
             erlang:error(Reason)
     end.
 
-read_chunk(Socket, Ssl, Size) ->
+read_chunk(Socket, Ssl, Size, false) ->
     ok = lhttpc_sock:setopts(Socket, [{packet, raw}], Ssl),
     case lhttpc_sock:recv(Socket, Size + 2, Ssl) of
         {ok, <<Chunk:Size/binary, "\r\n">>} ->
@@ -544,6 +568,26 @@ read_chunk(Socket, Ssl, Size) ->
             erlang:error({invalid_chunk, Data});
         {error, Reason} ->
             erlang:error(Reason)
+    end;
+read_chunk(Socket, Ssl, Size, true) ->
+    lhttpc_sock:setopts(Socket, [{packet, raw}], Ssl),
+    if
+        Size =< ?DROP_BLOCK_SIZE ->
+            case lhttpc_sock:recv(Socket, Size + 2, Ssl) of
+                {ok, <<Chunk:Size/binary, "\r\n">>} ->
+                    Chunk;
+                {ok, Data} ->
+                    erlang:error({invalid_chunk, Data});
+                {error, Reason} ->
+                    erlang:error(Reason)
+            end;
+        true ->
+            case lhttpc_sock:recv(Socket, ?DROP_BLOCK_SIZE, Ssl) of
+                {ok, _} ->
+                    read_chunk(Socket, Ssl, Size - ?DROP_BLOCK_SIZE, true);
+                {error, Reason} ->
+                    erlang:error(Reason)
+            end
     end.
 
 read_trailers(Socket, Ssl, Trailers, Hdrs, <<>>) ->
@@ -630,14 +674,16 @@ check_infinite_response(_, Hdrs) ->
         _            -> ok
     end.
 
-read_infinite_body(Socket, Hdrs, Ssl) ->
-    read_until_closed(Socket, <<>>, Hdrs, Ssl).
+read_infinite_body(Socket, Hdrs, Ssl, Drop) ->
+    read_until_closed(Socket, <<>>, Hdrs, Ssl, Drop).
 
-read_until_closed(Socket, Acc, Hdrs, Ssl) ->
+read_until_closed(Socket, Acc, Hdrs, Ssl, Drop) ->
     case lhttpc_sock:recv(Socket, Ssl) of
-        {ok, Body} ->
+        {ok, Body} when Drop =:= false ->
             NewAcc = <<Acc/binary, Body/binary>>,
-            read_until_closed(Socket, NewAcc, Hdrs, Ssl);
+            read_until_closed(Socket, NewAcc, Hdrs, Ssl, Drop);
+        {ok, _} when Drop =:= true ->
+            read_until_closed(Socket, Acc, Hdrs, Ssl, Drop);
         {error, closed} ->
             {Acc, Hdrs};
         {error, Reason} ->
