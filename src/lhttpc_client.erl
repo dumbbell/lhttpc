@@ -55,7 +55,15 @@
         part_size :: non_neg_integer() | infinity,
         %% in case of infinity we read whatever data we can get from
         %% the wire at that point or in case of chunked one chunk
-        drop_response_body = false :: true | false
+        drop_response_body = false :: true | false,
+        %% The following record members are all related to the stats
+        %% measurements.
+        measure_stats = false :: true | false,
+        request_headers_len :: non_neg_integer(),
+        decode_packet_type :: atom(),
+        decode_packet_more :: binary(),
+        timings_step :: atom(),
+        timings_tick :: term()
     }).
 
 -define(CONNECTION_HDR(HDRS, DEFAULT),
@@ -78,8 +86,20 @@
 %%    Option = {connect_timeout, Milliseconds}
 %% @end
 request(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
+    % If the caller wants us to report timings, we start the clock now.
+    % The clock will be stopped at the end of this function and the
+    % timings will be sent to the target process just after.
+    Measure_Stats = proplists:is_defined(report_stats, Options),
+    {Stats_Pid, Stats_Data, Timings_Start} = if
+        Measure_Stats ->
+            {_, T_Pid, T_Data} = lists:keyfind(report_stats, 1, Options),
+            {T_Pid, T_Data, erlang:now()};
+        true ->
+            {undefined, undefined, undefined}
+    end,
     Result = try
-        execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options)
+        execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options,
+          Measure_Stats, Timings_Start)
     catch
         Reason ->
             {response, self(), {error, Reason}};
@@ -87,6 +107,27 @@ request(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
             {response, self(), {error, connection_closed}};
         error:Error ->
             {exit, self(), {Error, erlang:get_stacktrace()}}
+    end,
+    % We can now stop the clock and send the stats, if the caller
+    % requested it. Doing it here permits us to report stats even in
+    % case of an error.
+    if
+        Measure_Stats ->
+            % Stats are messages sent to this process (self()). We
+            % receive them now.
+            Stats = gather_stats([]),
+            % The total time of the request is based on the
+            % Timings_Start (taken at the beginning of this function)
+            % and the last timing end.
+            Timings_Stop = erlang:now(),
+            Stats2 = [
+              {total_time, {Timings_Start, Timings_Stop}}
+              | Stats
+            ],
+            % We can now send those informations to the target process.
+            Stats_Pid ! {lhttpc, stats, Stats2, Stats_Data};
+        true ->
+            ok
     end,
     case Result of
         {response, _, {ok, {no_return, _}}} -> ok;
@@ -97,14 +138,23 @@ request(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
     unlink(From),
     ok.
 
-execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
+gather_stats(Stats) ->
+    receive
+        {stat, Type, Data} ->
+            gather_stats([{Type, Data} | Stats])
+    after 0 ->
+            Stats
+    end.
+
+execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options,
+  Measure_Stats, Timings_Start) ->
     UploadWindowSize = proplists:get_value(partial_upload, Options),
     PartialUpload = proplists:is_defined(partial_upload, Options),
     PartialDownload = proplists:is_defined(partial_download, Options),
     PartialDownloadOptions = proplists:get_value(partial_download, Options, []),
     NormalizedMethod = lhttpc_lib:normalize_method(Method),
-    {ChunkedUpload, Request} = lhttpc_lib:format_request(Path, NormalizedMethod,
-        Hdrs, Host, Port, Body, PartialUpload),
+    {ChunkedUpload, Request, Headers_Len} = lhttpc_lib:format_request(Path,
+      NormalizedMethod, Hdrs, Host, Port, Body, PartialUpload, Measure_Stats),
     SocketRequest = {socket, self(), Host, Port, Ssl},
     Socket = case gen_server:call(lhttpc_manager, SocketRequest, infinity) of
         {ok, S}   -> S; % Re-using HTTP/1.1 connections
@@ -131,7 +181,11 @@ execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options) ->
             PartialDownloadOptions, infinity),
         part_size = proplists:get_value(part_size,
             PartialDownloadOptions, infinity),
-        drop_response_body = proplists:get_bool(drop_response_body, Options)
+        drop_response_body = proplists:get_bool(drop_response_body, Options),
+        measure_stats = Measure_Stats,
+        request_headers_len = Headers_Len,
+        timings_tick = Timings_Start
+
     },
     Response = case send_request(State) of
         {R, undefined} ->
@@ -167,9 +221,59 @@ send_request(#client_state{socket = undefined} = State) ->
     Timeout = State#client_state.connect_timeout,
     ConnectOptions = State#client_state.connect_options,
     SocketOptions = [binary, {packet, http}, {active, false} | ConnectOptions],
-    case lhttpc_sock:connect(Host, Port, SocketOptions, Timeout, Ssl) of
+    Measure_Stats = State#client_state.measure_stats,
+    {NewState, Ret} = if
+        Measure_Stats ->
+            % Statistic: timing, "Resolve hostname" and "Open connection".
+            % When measuring timings, we split the connection into
+            % two steps:
+            %   - name resolution
+            %   - connection opening
+            Step1  = dns_lookup_time,
+            Start1 = State#client_state.timings_tick,
+            Ret1   = lhttpc_sock:resolve_host(Host),
+            Stop1  = erlang:now(),
+            self() ! {stat, Step1, {Start1, Stop1}},
+            State2 = State#client_state{
+              timings_step = Step1,
+              timings_tick = Stop1
+            },
+            case Ret1 of
+                {ok, IP_Addr, Family} ->
+                    Step2  = connection_time,
+                    Start2 = Stop1,
+                    % ssl (old implement) rejects inet or inet6 options...
+                    SocketOptions2 = if
+                        Ssl  -> [gather_stats | SocketOptions];
+                        true -> [gather_stats, Family | SocketOptions]
+                    end,
+                    Ret2 = lhttpc_sock:connect(IP_Addr, Port,
+                      SocketOptions2, Timeout, Ssl),
+                    Stop2  = erlang:now(),
+                    self() ! {stat, Step2, {Start2, Stop2}},
+                    State3 = State2#client_state{
+                      timings_step = Step2,
+                      timings_tick = Stop2
+                    },
+                    {
+                      State3,
+                      Ret2
+                    };
+                {error, Reason2} ->
+                    {
+                      State2,
+                      {error, Reason2}
+                    }
+            end;
+        true ->
+            {
+              State,
+              lhttpc_sock:connect(Host, Port, SocketOptions, Timeout, Ssl)
+            }
+    end,
+    case Ret of
         {ok, Socket} ->
-            send_request(State#client_state{socket = Socket});
+            send_request(NewState#client_state{socket = Socket});
         {error, etimedout} ->
             % TCP stack decided to give up
             throw(connect_timeout);
@@ -182,11 +286,12 @@ send_request(State) ->
     Socket = State#client_state.socket,
     Ssl = State#client_state.ssl,
     Request = State#client_state.request,
+    lhttpc_sock:reset_stats(Socket),
     case lhttpc_sock:send(Socket, Request, Ssl) of
         ok ->
             if
-                State#client_state.partial_upload     -> partial_upload(State);
-                not State#client_state.partial_upload -> read_response(State)
+                State#client_state.partial_upload -> partial_upload(State);
+                true                              -> read_response(State)
             end;
         {error, closed} ->
             lhttpc_sock:close(Socket, Ssl),
@@ -211,12 +316,12 @@ partial_upload_loop(State = #client_state{requester = Pid}) ->
             send_trailers(State, Trailers),
             read_response(State);
         {body_part, Pid, http_eob} ->
-            send_body_part(State, http_eob),
-            read_response(State);
+            NewState = send_body_part(State, http_eob),
+            read_response(NewState);
         {body_part, Pid, Data} ->
-            send_body_part(State, Data),
+            NewState = send_body_part(State, Data),
             Pid ! {ack, self()},
-            partial_upload_loop(State)
+            partial_upload_loop(NewState)
     end.
 
 send_body_part(State = #client_state{socket = Socket, ssl = Ssl}, BodyPart) ->
@@ -241,41 +346,88 @@ encode_body_part(#client_state{chunked_upload = true}, Data) ->
 encode_body_part(#client_state{chunked_upload = false}, Data) ->
     Data.
 
-check_send_result(_State, ok) ->
-    ok;
+check_send_result(State, ok) ->
+    State;
 check_send_result(#client_state{socket = Sock, ssl = Ssl}, {error, Reason}) ->
     lhttpc_sock:close(Sock, Ssl),
     throw(Reason).
 
 read_response(#client_state{socket = Socket, ssl = Ssl} = State) ->
-    ok = lhttpc_sock:setopts(Socket, [{packet, http}], Ssl),
-    read_response(State, nil, {nil, nil}, []).
+    % Statistic: timing, "Send request".
+    % Statistic: data sent, "Whole request".
+    State2 = if
+        State#client_state.measure_stats ->
+            Step  = request_send_time,
+            Start = State#client_state.timings_tick,
+            Stop  = erlang:now(),
+            self() ! {stat, Step, {Start, Stop}},
+            Bytes_Sent = lhttpc_sock:get_stat(Socket, bytes_sent),
+            Headers_Len = State#client_state.request_headers_len,
+            Body_Len    = Bytes_Sent - Headers_Len,
+            self() ! {stat, request_headers_length, Headers_Len},
+            self() ! {stat, request_body_length,    Body_Len},
+            self() ! {stat, request_length,         Bytes_Sent},
+            ok = lhttpc_sock:setopts(Socket, [{packet, raw}], Ssl),
+            State#client_state{
+              decode_packet_type = http,
+              decode_packet_more = <<>>,
+              timings_step = Step,
+              timings_tick = Stop
+            };
+        true ->
+            lhttpc_sock:setopts(Socket, [{packet, http}], Ssl),
+            State
+    end,
+    read_response(State2, nil, {nil, nil}, []).
 
-read_response(State, Vsn, {StatusCode, _} = Status, Hdrs) ->
+read_response(State, Vsn, Status, Hdrs) ->
     Socket = State#client_state.socket,
     Ssl = State#client_state.ssl,
-    case lhttpc_sock:recv(Socket, Ssl) of
-        {ok, {http_response, NewVsn, NewStatusCode, Reason}} ->
-            NewStatus = {NewStatusCode, Reason},
-            read_response(State, NewVsn, NewStatus, Hdrs);
-        {ok, {http_header, _, Name, _, Value}} ->
-            Header = {lhttpc_lib:maybe_atom_to_list(Name), Value},
-            read_response(State, Vsn, Status, [Header | Hdrs]);
-        {ok, http_eoh} when StatusCode >= 100, StatusCode =< 199 ->
-            % RFC 2616, section 10.1:
-            % A client MUST be prepared to accept one or more
-            % 1xx status responses prior to a regular
-            % response, even if the client does not expect a
-            % 100 (Continue) status message. Unexpected 1xx
-            % status responses MAY be ignored by a user agent.
-            read_response(State, nil, {nil, nil}, []);
-        {ok, http_eoh} ->
-            ok = lhttpc_sock:setopts(Socket, [{packet, raw}], Ssl),
-            Response = handle_response_body(State, Vsn, Status, Hdrs),
-            NewHdrs = element(2, Response),
-            ReqHdrs = State#client_state.request_headers,
-            NewSocket = maybe_close_socket(Socket, Ssl, Vsn, ReqHdrs, NewHdrs),
-            {Response, NewSocket};
+    Ret = lhttpc_sock:recv(Socket, Ssl),
+    % Statistic: timing, "Wait response".
+    State2 = if
+        State#client_state.measure_stats andalso
+        State#client_state.timings_step /= response_wait_time ->
+            Step  = response_wait_time,
+            Start = State#client_state.timings_tick,
+            Stop  = erlang:now(),
+            self() ! {stat, Step, {Start, Stop}},
+            State#client_state{
+              timings_step = Step,
+              timings_tick = Stop
+            };
+        true ->
+            State
+    end,
+    case Ret of
+        {ok, Packet} ->
+            if
+                State2#client_state.measure_stats ->
+                    Decode_Type = State2#client_state.decode_packet_type,
+                    Decode_More = State2#client_state.decode_packet_more,
+                    Packet2 = case Decode_More of
+                        <<>> -> Packet;
+                        _    -> list_to_binary([Decode_More, Packet])
+                    end,
+                    case erlang:decode_packet(Decode_Type, Packet2, []) of
+                        {ok, HTTP_Packet, Rest} ->
+                            State3 = State2#client_state{
+                              decode_packet_more = <<>>
+                            },
+                            lhttpc_sock:unrecv(Socket, Rest),
+                            read_response2(State3, Vsn, Status, Hdrs,
+                              HTTP_Packet);
+                        {more, _} ->
+                            State3 = State2#client_state{
+                              decode_packet_more = Packet2
+                            },
+                            read_response(State3, Vsn, Status, Hdrs);
+                        {error, Reason} ->
+                            erlang:error(Reason)
+                    end;
+                true ->
+                    read_response2(State2, Vsn, Status, Hdrs, Packet)
+            end;
         {error, closed} ->
             % Either we only noticed that the socket was closed after we
             % sent the request, the server closed it just after we put
@@ -283,7 +435,7 @@ read_response(State, Vsn, {StatusCode, _} = Status, Hdrs) ->
             % closing connections without sending responses.
             % If this the first attempt to send the request, we will try again.
             lhttpc_sock:close(Socket, Ssl),
-            NewState = State#client_state{
+            NewState = State2#client_state{
                 socket = undefined,
                 attempts = State#client_state.attempts - 1
             },
@@ -292,21 +444,93 @@ read_response(State, Vsn, {StatusCode, _} = Status, Hdrs) ->
             erlang:error(Reason)
     end.
 
+read_response2(State, Vsn, {StatusCode, _} = Status, Hdrs, HTTP_Packet) ->
+    case HTTP_Packet of
+        {http_response, NewVsn, NewStatusCode, Reason} ->
+            NewStatus = {NewStatusCode, Reason},
+            State2 = State#client_state{
+              decode_packet_type = httph
+            },
+            read_response(State2, NewVsn, NewStatus, Hdrs);
+        {http_header, _, Name, _, Value} ->
+            Header = {lhttpc_lib:maybe_atom_to_list(Name), Value},
+            read_response(State, Vsn, Status, [Header | Hdrs]);
+        http_eoh when StatusCode >= 100, StatusCode =< 199 ->
+            % RFC 2616, section 10.1:
+            % A client MUST be prepared to accept one or more
+            % 1xx status responses prior to a regular
+            % response, even if the client does not expect a
+            % 100 (Continue) status message. Unexpected 1xx
+            % status responses MAY be ignored by a user agent.
+            read_response(State, nil, {nil, nil}, []);
+        http_eoh ->
+            Socket = State#client_state.socket,
+            Ssl = State#client_state.ssl,
+            % Statistic: data received, "Response headers".
+            Header_Len = if
+                State#client_state.measure_stats ->
+                    Socket = State#client_state.socket,
+                    Bytes_Received1 = lhttpc_sock:get_stat(Socket,
+                      bytes_received),
+                    self() ! {stat, response_headers_length, Bytes_Received1},
+                    Bytes_Received1;
+                true ->
+                    0
+            end,
+            ok = lhttpc_sock:setopts(Socket, [{packet, raw}], Ssl),
+            {_, Response} = handle_response_body(State, Vsn, Status, Hdrs),
+            % Statistic: data received, "Whole response".
+            if
+                State#client_state.measure_stats ->
+                    Socket = State#client_state.socket,
+                    Bytes_Received2 = lhttpc_sock:get_stat(Socket,
+                      bytes_received),
+                    Body_Len = Bytes_Received2 - Header_Len,
+                    self() ! {stat, response_body_length, Body_Len},
+                    self() ! {stat, response_length,      Bytes_Received2};
+                true ->
+                    ok
+            end,
+            NewHdrs = element(2, Response),
+            ReqHdrs = State#client_state.request_headers,
+            NewSocket = maybe_close_socket(Socket, Ssl, Vsn, ReqHdrs, NewHdrs),
+            {Response, NewSocket};
+        {http_error, Data} ->
+            erlang:error({bad_header, Data})
+    end.
+
 handle_response_body(#client_state{partial_download = false} = State, Vsn,
         Status, Hdrs) ->
     Drop = State#client_state.drop_response_body,
     Socket = State#client_state.socket,
     Ssl = State#client_state.ssl,
     Method = State#client_state.method,
-    {Body, NewHdrs} = case has_body(Method, element(1, Status), Hdrs) of
-        true  -> read_body(Vsn, Hdrs, Ssl, Socket, body_type(Hdrs), Drop);
-        false -> {<<>>, Hdrs}
+    {Body, NewHdrs, State2} = case has_body(Method, element(1, Status), Hdrs) of
+        true ->
+            read_body(Vsn, Hdrs, Ssl, Socket, body_type(Hdrs), Drop,
+              State);
+        false ->
+            {<<>>, Hdrs, State}
     end,
-    {Status, NewHdrs, Body};
+    % Statistic: timing, "Receive response".
+    State3 = if
+        State2#client_state.measure_stats ->
+            Step  = response_recv_time,
+            Start = State2#client_state.timings_tick,
+            Stop  = erlang:now(),
+            self() ! {stat, Step, {Start, Stop}},
+            State2#client_state{
+              timings_step = Step,
+              timings_tick = Stop
+            };
+        true ->
+            State2
+    end,
+    {State3, {Status, NewHdrs, Body}};
 handle_response_body(#client_state{partial_download = true} = State, Vsn,
         Status, Hdrs) ->
     Method = State#client_state.method,
-    case has_body(Method, element(1, Status), Hdrs) of
+    Ret = case has_body(Method, element(1, Status), Hdrs) of
         true ->
             Response = {ok, {Status, Hdrs, self()}},
             State#client_state.requester ! {response, self(), Response},
@@ -316,7 +540,22 @@ handle_response_body(#client_state{partial_download = true} = State, Vsn,
             Res;
         false ->
             {Status, Hdrs, undefined}
-    end.
+    end,
+    % Statistic: timing, "Receive response".
+    State2 = if
+        State#client_state.measure_stats ->
+            Step  = response_recv_time,
+            Start = State#client_state.timings_tick,
+            Stop  = erlang:now(),
+            self() ! {stat, Step, {Start, Stop}},
+            State#client_state{
+              timings_step = Step,
+              timings_tick = Stop
+            };
+        true ->
+            State
+    end,
+    {State2, Ret}.
 
 has_body("HEAD", _, _) ->
     % HEAD responses aren't allowed to include a body
@@ -368,13 +607,15 @@ read_partial_body(State, _Vsn, Hdrs, {fixed_length, ContentLength}) ->
     read_partial_finite_body(State, Hdrs, ContentLength,
         State#client_state.download_window).
 
-read_body(_Vsn, Hdrs, Ssl, Socket, chunked, Drop) ->
-    read_chunked_body(Socket, Ssl, Hdrs, [], Drop);
-read_body(Vsn, Hdrs, Ssl, Socket, infinite, Drop) ->
+read_body(_Vsn, Hdrs, Ssl, Socket, chunked, Drop, State) ->
+    read_chunked_body(Socket, Ssl, Hdrs, [], Drop, State);
+read_body(Vsn, Hdrs, Ssl, Socket, infinite, Drop, State) ->
     check_infinite_response(Vsn, Hdrs),
-    read_infinite_body(Socket, Hdrs, Ssl, Drop);
-read_body(_Vsn, Hdrs, Ssl, Socket, {fixed_length, ContentLength}, Drop) ->
-    read_length(Hdrs, Ssl, Socket, ContentLength, Drop).
+    {Body, Hdrs} = read_infinite_body(Socket, Hdrs, Ssl, Drop),
+    {Body, Hdrs, State};
+read_body(_Vsn, Hdrs, Ssl, Socket, {fixed_length, ContentLength}, Drop, State) ->
+    {Body, Hdrs} = read_length(Hdrs, Ssl, Socket, ContentLength, Drop),
+    {Body, Hdrs, State}.
 
 read_partial_finite_body(State = #client_state{}, Hdrs, 0, _Window) ->
     reply_end_of_body(State, [], Hdrs);
@@ -461,8 +702,8 @@ read_partial_chunked_body(State, Hdrs, Window, BufferSize, Buffer, 0) ->
     case read_chunk_size(Socket, Ssl) of
         0 ->
             reply_chunked_part(State, Buffer, Window),
-            {Trailers, NewHdrs} = read_trailers(Socket, Ssl, [], Hdrs, <<>>),
-            reply_end_of_body(State, Trailers, NewHdrs);
+            {Trailers, NewHdrs, State2} = read_trailers(Socket, Ssl, [], Hdrs, State),
+            reply_end_of_body(State2, Trailers, NewHdrs);
         ChunkSize when PartSize =:= infinity ->
             Chunk = read_chunk(Socket, Ssl, ChunkSize, false),
             NewWindow = reply_chunked_part(State, [Chunk | Buffer], Window),
@@ -521,18 +762,19 @@ reply_chunked_part(#client_state{requester = Pid}, Buffer, Window) ->
         lhttpc_lib:dec(Window)
     end.
 
-read_chunked_body(Socket, Ssl, Hdrs, Chunks, Drop) ->
+read_chunked_body(Socket, Ssl, Hdrs, Chunks, Drop, State) ->
     case read_chunk_size(Socket, Ssl) of
         0 ->
             Body = if
                 Drop -> <<>>;
                 true -> list_to_binary(lists:reverse(Chunks))
             end,
-            {_, NewHdrs} = read_trailers(Socket, Ssl, [], Hdrs, <<>>),
-            {Body, NewHdrs};
+            {_, NewHdrs, State2} = read_trailers(Socket, Ssl, [], Hdrs, State),
+            {Body, NewHdrs, State2};
         Size ->
             Chunk = read_chunk(Socket, Ssl, Size, Drop),
-            read_chunked_body(Socket, Ssl, Hdrs, [Chunk | Chunks], Drop)
+            read_chunked_body(Socket, Ssl, Hdrs, [Chunk | Chunks], Drop,
+              State)
     end.
 
 chunk_size(Bin) ->
@@ -590,38 +832,48 @@ read_chunk(Socket, Ssl, Size, true) ->
             end
     end.
 
-read_trailers(Socket, Ssl, Trailers, Hdrs, <<>>) ->
+read_trailers(Socket, Ssl, Trailers, Hdrs, State) ->
     case lhttpc_sock:recv(Socket, Ssl) of
         {ok, Data} ->
-            read_trailers(Socket, Ssl, Trailers, Hdrs, Data);
+            Decode_More = State#client_state.decode_packet_more,
+            Data2 = case Decode_More of
+                <<>> -> Data;
+                _    -> list_to_binary([Decode_More, Data])
+            end,
+            State2 = State#client_state{
+              decode_packet_more = <<>>
+            },
+            read_trailers(Socket, Ssl, Trailers, Hdrs, State2, Data2);
         {error, closed} ->
-            {Hdrs, Trailers};
+            {Trailers, Hdrs, State};
         {error, Error} ->
             erlang:error(Error)
-    end;
-read_trailers(Socket, Ssl, Trailers, Hdrs, Buffer) ->
+    end.
+
+read_trailers(Socket, Ssl, Trailers, Hdrs, State, Buffer) ->
     case erlang:decode_packet(httph, Buffer, []) of
         {ok, {http_header, _, Name, _, Value}, NextBuffer} ->
             Header = {Name, Value},
             NTrailers = [Header | Trailers],
             NHeaders = [Header | Hdrs],
-            read_trailers(Socket, Ssl, NTrailers, NHeaders, NextBuffer);
-        {ok, http_eoh, _} ->
-            {Trailers, Hdrs};
-		{ok, {http_error, HttpString}, _} ->
+            read_trailers(Socket, Ssl, NTrailers, NHeaders, State, NextBuffer);
+        {ok, http_eoh, NextBuffer} ->
+            lhttpc_sock:unrecv(Socket, NextBuffer),
+            {Trailers, Hdrs, State};
+        {ok, {http_error, HttpString}, _} ->
             erlang:error({bad_trailer, HttpString});
         {more, _} ->
             case lhttpc_sock:recv(Socket, Ssl) of
                 {ok, Data} ->
                     BufferAndData = list_to_binary([Buffer, Data]),
-                    read_trailers(Socket, Ssl, Trailers, Hdrs, BufferAndData);
+                    read_trailers(Socket, Ssl, Trailers, Hdrs, State, BufferAndData);
                 {error, closed} ->
-                    {Hdrs, Trailers};
+                    erlang:error({bad_trailer, closed});
                 {error, Error} ->
                     erlang:error(Error)
             end;
-        {error, Reason} ->
-            erlang:error({bad_trailer, Reason})
+        {error, Error} ->
+            erlang:error(Error)
     end.
 
 reply_end_of_body(#client_state{requester = Requester}, Trailers, Hdrs) ->

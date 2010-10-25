@@ -32,7 +32,7 @@
 
 -export([
         parse_url/1,
-        format_request/7,
+        format_request/8,
         header_value/2,
         header_value/3,
         normalize_method/1
@@ -135,7 +135,7 @@ split_port(_,[$/ | _] = Path, Port) ->
 split_port(Scheme, [P | T], Port) ->
     split_port(Scheme, T, [P | Port]).
 
-%% @spec (Path, Method, Headers, Host, Port, Body, PartialUpload) -> Request
+%% @spec (Path, Method, Headers, Host, Port, Body, PartialUpload, Measure_Headers) -> Request
 %% Path = iolist()
 %% Method = atom() | string()
 %% Headers = [{atom() | string(), string()}]
@@ -143,18 +143,27 @@ split_port(Scheme, [P | T], Port) ->
 %% Port = integer()
 %% Body = iolist()
 %% PartialUpload = true | false
+%% Measure_Headers = true | false
 -spec format_request(iolist(), atom() | string(), headers(), string(),
-    integer(), iolist(), true | false ) -> {true | false, iolist()}.
-format_request(Path, Method, Hdrs, Host, Port, Body, PartialUpload) ->
+    integer(), iolist(), true | false, true | false ) -> {true | false, iolist(), non_neg_integer()}.
+format_request(Path, Method, Hdrs, Host, Port, Body, PartialUpload,
+  Measure_Headers) ->
     AllHdrs = add_mandatory_hdrs(Method, Hdrs, Host, Port, Body, PartialUpload),
     IsChunked = is_chunked(AllHdrs),
+    First_Line = [Method, " ", Path, " HTTP/1.1\r\n"],
+    Headers_Bin = format_hdrs(AllHdrs),
+    Headers_Len = if
+        Measure_Headers -> iolist_size([First_Line, Headers_Bin]);
+        true            -> 0
+    end,
     {
         IsChunked,
         [
-            Method, " ", Path, " HTTP/1.1\r\n",
-            format_hdrs(AllHdrs),
+            First_Line,
+            Headers_Bin,
             format_body(Body, IsChunked)
-        ]
+        ],
+        Headers_Len
     }.
 
 %% @spec normalize_method(AtomOrString) -> Method

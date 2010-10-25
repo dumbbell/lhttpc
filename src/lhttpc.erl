@@ -42,6 +42,10 @@
         get_body_part/1,
         get_body_part/2
         ]).
+-export([
+        get_stats_report/0,
+        get_stats_report/1
+        ]).
 
 -include("lhttpc_types.hrl").
 
@@ -52,6 +56,9 @@
 -spec start(normal | {takeover, node()} | {failover, node()}, any()) ->
     {ok, pid()}.
 start(_, _) ->
+    % When reporting statistics, lhttpc_sock stores everything in an ETS
+    % table where the key is the socket().
+    ets:new(lhttpc_sock_states, [public, named_table]),
     case lists:member({seed,1}, ssl:module_info(exports)) of
         true ->
             % Make sure that the ssl random number generator is seeded
@@ -496,6 +503,21 @@ get_body_part(Pid, Timeout) ->
         kill_client(Pid)
     end.
 
+-spec get_stats_report() ->
+        {ok, [{atom(), term(), term()}], term()}.
+get_stats_report() ->
+    get_stats_report(infinity).
+
+-spec get_stats_report(non_neg_integer() | infinity) ->
+        {ok, [{atom(), term(), term()}], term()} | {error, no_stats}.
+get_stats_report(Timeout) ->
+    receive
+        {lhttpc, stats, Stats, Private} ->
+            {ok, lists:reverse(Stats), Private}
+    after Timeout ->
+            {error, no_stats}
+    end.
+
 %%% Internal functions
 
 -spec read_response(pid(), timeout()) -> result().
@@ -554,6 +576,9 @@ verify_options([drop_response_body | Options], Errors) ->
     verify_options(Options, Errors);
 verify_options([{drop_response_body, Bool} | Options], Errors)
         when is_boolean(Bool) ->
+    verify_options(Options, Errors);
+verify_options([{report_stats, Pid, _Data} | Options], Errors)
+        when is_pid(Pid) ->
     verify_options(Options, Errors);
 verify_options([{connect_options, List} | Options], Errors)
         when is_list(List) ->
