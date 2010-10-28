@@ -327,7 +327,14 @@ request(URL, Method, Hdrs, Body, Timeout, Options) ->
 request(Host, Port, Ssl, Path, Method, Hdrs, Body, Timeout, Options) ->
     verify_options(Options, []),
     Args = [self(), Host, Port, Ssl, Path, Method, Hdrs, Body, Options],
-    Pid = spawn_link(lhttpc_client, request, Args),
+    Pid = case proplists:get_bool(no_spawn, Options) of
+        false ->
+            spawn_link(lhttpc_client, request, Args);
+        true ->
+            lhttpc_client:request(self(),
+              Host, Port, Ssl, Path, Method, Hdrs, Body, Options),
+            self()
+    end,
     receive
         {response, Pid, R} ->
             R;
@@ -572,6 +579,8 @@ verify_options([{partial_download, DownloadOptions} | Options], Errors)
             NewErrors = [{partial_download, OptionErrors} | Errors],
             verify_options(Options, NewErrors)
     end;
+verify_options([no_spawn | Options], Errors) ->
+    verify_options(Options, Errors);
 verify_options([drop_response_body | Options], Errors) ->
     verify_options(Options, Errors);
 verify_options([{drop_response_body, Bool} | Options], Errors)
