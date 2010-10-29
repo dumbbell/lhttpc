@@ -155,10 +155,24 @@ execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options,
     NormalizedMethod = lhttpc_lib:normalize_method(Method),
     {ChunkedUpload, Request, Headers_Len} = lhttpc_lib:format_request(Path,
       NormalizedMethod, Hdrs, Host, Port, Body, PartialUpload, Measure_Stats),
-    SocketRequest = {socket, self(), Host, Port, Ssl},
-    Socket = case gen_server:call(lhttpc_manager, SocketRequest, infinity) of
-        {ok, S}   -> S; % Re-using HTTP/1.1 connections
-        no_socket -> undefined % Opening a new HTTP/1.1 connection
+    Socket_From_Caller = proplists:get_value(socket, Options),
+    Socket = case Socket_From_Caller of
+        undefined ->
+            % The caller doesn't provide a socket. Get one from the
+            % connection manager.
+            SocketRequest = {socket, self(), Host, Port, Ssl},
+            case gen_server:call(lhttpc_manager, SocketRequest, infinity) of
+                {ok, S}   -> S; % Re-using HTTP/1.1 connections
+                no_socket -> undefined % Opening a new HTTP/1.1 connection
+            end;
+        S ->
+            % Wait that the parent process change the socket controlling
+            % process to us.
+            case self() of
+                From -> ok;
+                _    -> receive socket_ready -> ok end
+            end,
+            S
     end,
     State = #client_state{
         host = Host,
@@ -199,13 +213,34 @@ execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options,
             % * The socket was closed remotely already
             % * Due to an error in this module (returning dead sockets for
             %   instance)
-            ManagerPid = whereis(lhttpc_manager),
-            case lhttpc_sock:controlling_process(NewSocket, ManagerPid, Ssl) of
-                ok ->
-                    gen_server:cast(lhttpc_manager,
-                        {done, Host, Port, Ssl, NewSocket});
+            case Socket_From_Caller of
+                undefined ->
+                    ManagerPid = whereis(lhttpc_manager),
+                    Ret = lhttpc_sock:controlling_process(NewSocket,
+                      ManagerPid, Ssl),
+                    case Ret of
+                        ok ->
+                            gen_server:cast(lhttpc_manager,
+                              {done, Host, Port, Ssl, NewSocket});
+                        _ ->
+                            lhttpc_sock:close(NewSocket),
+                            ok
+                    end;
                 _ ->
-                    ok
+                    case self() of
+                        From ->
+                            % We're executed from the caller's process,
+                            % no need to change controlling process.
+                            From ! {lhttpc, socket, NewSocket};
+                        _ ->
+                            % Give the new socket back to the calling process.
+                            Ret = lhttpc_sock:controlling_process(NewSocket,
+                              From, Ssl),
+                            case Ret of
+                                ok -> From ! {lhttpc, socket, NewSocket};
+                                _  -> lhttpc_sock:close(NewSocket)
+                            end
+                    end
             end,
             {ok, R}
     end,
@@ -239,14 +274,11 @@ send_request(#client_state{socket = undefined} = State) ->
               timings_tick = Stop1
             },
             case Ret1 of
-                {ok, IP_Addr, Family} ->
+                {ok, IP_Addr} ->
                     Step2  = connection_time,
                     Start2 = Stop1,
                     % ssl (old implement) rejects inet or inet6 options...
-                    SocketOptions2 = if
-                        Ssl  -> [gather_stats | SocketOptions];
-                        true -> [gather_stats, Family | SocketOptions]
-                    end,
+                    SocketOptions2 = [gather_stats | SocketOptions],
                     Ret2 = lhttpc_sock:connect(IP_Addr, Port,
                       SocketOptions2, Timeout, Ssl),
                     Stop2  = erlang:now(),

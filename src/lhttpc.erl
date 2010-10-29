@@ -43,6 +43,7 @@
         get_body_part/2
         ]).
 -export([
+        get_back_socket/0,
         get_stats_report/0,
         get_stats_report/1
         ]).
@@ -326,10 +327,16 @@ request(URL, Method, Hdrs, Body, Timeout, Options) ->
     headers(), iolist(), pos_integer(), [option()]) -> result().
 request(Host, Port, Ssl, Path, Method, Hdrs, Body, Timeout, Options) ->
     verify_options(Options, []),
-    Args = [self(), Host, Port, Ssl, Path, Method, Hdrs, Body, Options],
     Pid = case proplists:get_bool(no_spawn, Options) of
         false ->
-            spawn_link(lhttpc_client, request, Args);
+            Args = [self(), Host, Port, Ssl, Path, Method, Hdrs, Body, Options],
+            P = spawn_link(lhttpc_client, request, Args),
+            case proplists:get_value(socket, Options) of
+                undefined -> ok;
+                Socket    -> lhttpc_sock:controlling_process(Socket, P, Ssl)
+            end,
+            P ! socket_ready,
+            P;
         true ->
             lhttpc_client:request(self(),
               Host, Port, Ssl, Path, Method, Hdrs, Body, Options),
@@ -510,6 +517,16 @@ get_body_part(Pid, Timeout) ->
         kill_client(Pid)
     end.
 
+-spec get_back_socket() ->
+        term() | undefined.
+get_back_socket() ->
+    receive
+        {lhttpc, socket, Socket} ->
+            Socket
+    after 0 ->
+            undefined
+    end.
+
 -spec get_stats_report() ->
         {ok, [{atom(), term(), term()}], term()}.
 get_stats_report() ->
@@ -579,6 +596,8 @@ verify_options([{partial_download, DownloadOptions} | Options], Errors)
             NewErrors = [{partial_download, OptionErrors} | Errors],
             verify_options(Options, NewErrors)
     end;
+verify_options([{socket, _} | Options], Errors) ->
+    verify_options(Options, Errors);
 verify_options([no_spawn | Options], Errors) ->
     verify_options(Options, Errors);
 verify_options([drop_response_body | Options], Errors) ->
