@@ -45,19 +45,18 @@
         reset_stats/1
     ]).
 
--include_lib("kernel/include/inet.hrl").
-
 -include("lhttpc_types.hrl").
 
 -spec resolve_host(list()) -> {ok, tuple(), atom()} | {error, term()}.
 resolve_host(Host) ->
-    case inet:gethostbyname(Host) of
-        {ok, Hostent} ->
-            [IP_Addr | _] = Hostent#hostent.h_addr_list,
-            Family = Hostent#hostent.h_addrtype,
-            {ok, IP_Addr, Family};
-        {error, Reason} ->
-            {error, Reason}
+    case inet_parse:address(Host) of
+        {ok, IP_Addr} ->
+            {ok, IP_Addr};
+        _ ->
+            case inet:getaddr(Host, inet) of
+                {ok, IP_Addr}   -> {ok, IP_Addr};
+                {error, Reason} -> {error, Reason}
+            end
     end.
 
 %% @spec (Host, Port, Options, Timeout, SslFlag) -> {ok, Socket} | {error, Reason}
