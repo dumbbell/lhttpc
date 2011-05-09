@@ -100,40 +100,25 @@ maybe_atom_to_list(List) when is_list(List) ->
 %% @doc
 -spec parse_url(string()) -> {string(), integer(), string(), boolean()}.
 parse_url(URL) ->
-    % XXX This should be possible to do with the re module?
-    {Scheme, HostPortPath} = split_scheme(URL),
-    {Host, PortPath} = split_host(HostPortPath, []),
-    {Port, Path} = split_port(Scheme, PortPath, []),
-    {string:to_lower(Host), Port, Path, Scheme =:= https}.
-
-split_scheme("http://" ++ HostPortPath) ->
-    {http, HostPortPath};
-split_scheme("https://" ++ HostPortPath) ->
-    {https, HostPortPath}.
-
-split_host([$: | PortPath], Host) ->
-    {lists:reverse(Host), PortPath};
-split_host([$/ | _] = PortPath, Host) ->
-    {lists:reverse(Host), PortPath};
-split_host([H | T], Host) ->
-    split_host(T, [H | Host]);
-split_host([], Host) ->
-    {lists:reverse(Host), []}.
-
-split_port(http, [$/ | _] = Path, []) ->
-    {80, Path};
-split_port(https, [$/ | _] = Path, []) ->
-    {443, Path};
-split_port(http, [], []) ->
-    {80, "/"};
-split_port(https, [], []) ->
-    {443, "/"};
-split_port(_, [], Port) ->
-    {list_to_integer(lists:reverse(Port)), "/"};
-split_port(_,[$/ | _] = Path, Port) ->
-    {list_to_integer(lists:reverse(Port)), Path};
-split_port(Scheme, [P | T], Port) ->
-    split_port(Scheme, T, [P | Port]).
+    {match, [Scheme, Host, Port_S, Path]} = re:run(URL,
+      "(https?)://"       %% Scheme
+      "("                 %% Host:
+      "\\[(?:[^\\]]*)\\]" %%   in [ ... ] (RFC 2732, eg. "[::1]")
+      "|"                 %%   or
+      "(?:[^:/]*)"        %%   ...     (eg. "localhost")
+      ")"
+      "(?:"               %% Port:
+      ":([0-9]*)"         %%   :8080
+      "|)"                %%   or no port
+      "(/?.*)",           %% Path (may be absent)
+      [{capture, all_but_first, list}]),
+    SSL  = Scheme == "https",
+    Port = case Port_S of
+        "" when SSL -> 443;
+        ""          -> 80;
+        _           -> list_to_integer(Port_S)
+    end,
+    {string:to_lower(Host), Port, Path, SSL}.
 
 %% @spec (Path, Method, Headers, Host, Port, Body, PartialUpload, Measure_Headers) -> Request
 %% Path = iolist()
