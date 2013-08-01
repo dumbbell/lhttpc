@@ -39,6 +39,7 @@
         unrecv/2,
         send/3,
         controlling_process/3,
+        getopts/3,
         setopts/3,
         close/2,
         get_stat/2,
@@ -113,7 +114,7 @@ connect2(Host, Port, Options, Timeout, false) ->
     {ok, any()} | {error, atom()} | {error, {http_error, string()}}.
 recv({Socket, false}, Ssl) ->
     recv2(Socket, 0, Ssl);
-recv({Socket, true}, Ssl) ->
+recv({Socket, true} = This, Ssl) ->
     [{_, Previous_Data, Sent, Received}] = ets:lookup(lhttpc_sock_states,
       Socket),
     case Previous_Data of
@@ -127,9 +128,38 @@ recv({Socket, true}, Ssl) ->
                     {error, Reason}
             end;
         _ ->
-            State = {Socket, <<>>, Sent, Received + size(Previous_Data)},
-            ets:insert(lhttpc_sock_states, State),
-            {ok, Previous_Data}
+            case getopts(This, [packet], Ssl) of
+                {ok, [{packet, line}]} ->
+                    case re:run(Previous_Data, "(.*\r\n)", [multiline]) of
+                        {match, [_, {_, L}]} ->
+                            <<Data:L/binary, Previous_Data2/binary>> =
+                              Previous_Data,
+                            State = {Socket, Previous_Data2, Sent,
+                              Received + L},
+                            ets:insert(lhttpc_sock_states, State),
+                            {ok, Data};
+                        nomatch ->
+                            case recv2(Socket, 0, Ssl) of
+                                {ok, Data} ->
+                                    State = {Socket, <<>>, Sent,
+                                      Received + size(Previous_Data) +
+                                      size(Data)},
+                                    ets:insert(lhttpc_sock_states, State),
+                                    {ok, <<Previous_Data/binary, Data/binary>>};
+                                {error, Reason} ->
+                                    % We adopt the same behaviour as
+                                    % gen_tcp:recv/2: if an error occurs
+                                    % while reading, less than Length
+                                    % bytes of data maybe discarded.
+                                    {error, Reason}
+                            end
+                    end;
+                _ ->
+                    State = {Socket, <<>>, Sent,
+                      Received + size(Previous_Data)},
+                    ets:insert(lhttpc_sock_states, State),
+                    {ok, Previous_Data}
+            end
     end.
 
 %% @spec (Socket, Length, SslFlag) -> {ok, Data} | {error, Reason}
@@ -246,6 +276,21 @@ controlling_process({Socket, _}, Pid, true) ->
     ssl:controlling_process(Socket, Pid);
 controlling_process({Socket, _}, Pid, false) ->
     gen_tcp:controlling_process(Socket, Pid).
+
+%% @spec (Socket, Options, SslFlag) -> ok | {error, Reason}
+%%   Socket = {socket(), boolean()}
+%%   Options = [atom()]
+%%   SslFlag = boolean()
+%%   Reason = atom()
+%% @doc
+%% Gets options for a socket. Look in `inet:getopts/2' for more info.
+%% @end
+-spec getopts({socket(), boolean()}, socket_options(), boolean()) ->
+    ok | {error, atom()}.
+getopts({Socket, _}, Options, true) ->
+    ssl:getopts(Socket, Options);
+getopts({Socket, _}, Options, false) ->
+    inet:getopts(Socket, Options).
 
 %% @spec (Socket, Options, SslFlag) -> ok | {error, Reason}
 %%   Socket = {socket(), boolean()}
