@@ -105,12 +105,12 @@ parse_url(URL) ->
       "("                 %% Host:
       "\\[(?:[^\\]]*)\\]" %%   in [ ... ] (RFC 2732, eg. "[::1]")
       "|"                 %%   or
-      "(?:[^:/]*)"        %%   ...     (eg. "localhost")
+      "(?:[^:/?]*)"       %%   ...     (eg. "localhost")
       ")"
       "(?:"               %% Port:
       ":([0-9]*)"         %%   :8080
       "|)"                %%   or no port
-      "(/?.*)",           %% Path (may be absent)
+      "(.*)",             %% Path (may be absent)
       [{capture, all_but_first, list}]),
     SSL  = Scheme == "https",
     Port = case Port_S of
