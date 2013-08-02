@@ -157,9 +157,9 @@ terminate(_, State) ->
     close_sockets(State#httpc_man.sockets).
 
 %% @hidden
--spec code_change(any(), #httpc_man{}, any()) -> #httpc_man{}.
+-spec code_change(any(), #httpc_man{}, any()) -> {ok, #httpc_man{}}.
 code_change(_, State, _) ->
-    State.
+    {ok, State}.
 
 find_socket({_, _, Ssl} = Dest, Pid, State) ->
     Dests = State#httpc_man.destinations,
