@@ -596,9 +596,13 @@ verify_options([{partial_download, DownloadOptions} | Options], Errors)
             NewErrors = [{partial_download, OptionErrors} | Errors],
             verify_options(Options, NewErrors)
     end;
-verify_options([{socket, _} | Options], Errors) ->
+verify_options([{socket, {_, Gather_Stats}} | Options], Errors)
+        when is_boolean(Gather_Stats) ->
     verify_options(Options, Errors);
 verify_options([no_spawn | Options], Errors) ->
+    verify_options(Options, Errors);
+verify_options([{no_spawn, Bool} | Options], Errors)
+        when is_boolean(Bool) ->
     verify_options(Options, Errors);
 verify_options([drop_response_body | Options], Errors) ->
     verify_options(Options, Errors);
