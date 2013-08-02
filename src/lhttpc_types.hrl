@@ -27,13 +27,24 @@
 -type header() :: {string() | atom(), string()}.
 -type headers() :: [header()].
 
--type socket() :: _.
+-type socket() :: gen_tcp:socket() | ssl:sslsocket().
+
+-type partial_download_option() ::
+        {window_size, infinity | non_neg_integer()} |
+        {part_size, infinity | non_neg_integer()}.
 
 -type option() ::
         {connect_timeout, timeout()} |
         {send_retry, non_neg_integer()} |
         {partial_upload, non_neg_integer() | infinity} |
-        {partial_download, pid(), non_neg_integer() | infinity}.
+        {partial_download, [partial_download_option()]} |
+        {socket, {socket(), boolean()}} |
+        drop_response_body |
+        {drop_response_body, boolean()} |
+        no_spawn |
+        {no_spawn, boolean()} |
+        {report_stats, pid(), any()} |
+        {connect_options, any()}.
 
 -type options() :: [option()].
 
