@@ -223,7 +223,7 @@ execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options,
                             gen_server:cast(lhttpc_manager,
                               {done, Host, Port, Ssl, NewSocket});
                         _ ->
-                            lhttpc_sock:close(NewSocket),
+                            lhttpc_sock:close(NewSocket, Ssl),
                             ok
                     end;
                 _ ->
@@ -238,7 +238,7 @@ execute(From, Host, Port, Ssl, Path, Method, Hdrs, Body, Options,
                               From, Ssl),
                             case Ret of
                                 ok -> From ! {lhttpc, socket, NewSocket};
-                                _  -> lhttpc_sock:close(NewSocket)
+                                _  -> lhttpc_sock:close(NewSocket, Ssl)
                             end
                     end
             end,
